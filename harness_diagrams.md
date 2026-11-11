@@ -1,7 +1,6 @@
 # Program flow of harness.py
 
-The diagrams describe the registered state of `harness.py` (version
-3.9-en). GitHub renders them directly.
+The following diagrams describe the registered state of `harness.py`.
 
 ## 1. Overall flow
 
