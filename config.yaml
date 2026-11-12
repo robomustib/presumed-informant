@@ -89,7 +89,7 @@ topics:
       Reducing class size in the early school years has no effect on
       achievement.
 
-repetitions: 3
+repetitions: 5
 
 output_dir: "./data/runs"
 request_timeout: 300.0

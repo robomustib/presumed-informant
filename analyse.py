@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -286,6 +288,12 @@ def write_rows(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
         w.writerows(rows)
 
 
+def subsample_size(n_conversations: int, n: int, share: float | None) -> int:
+    if share is not None:
+        return max(1, round(n_conversations * share))
+    return max(1, min(n, n_conversations))
+
+
 def cmd_split(args: argparse.Namespace) -> int:
     with Path(args.sheet).open(encoding="utf-8", newline="") as fh:
         rows = list(csv.DictReader(fh))
@@ -294,7 +302,7 @@ def cmd_split(args: argparse.Namespace) -> int:
     out = Path(args.out)
 
     convs = sorted({r["run_id_blind"] for r in rows})
-    k = max(1, round(len(convs) * args.share))
+    k = subsample_size(len(convs), args.n, args.share)
     subsample = set(random.Random(args.seed).sample(convs, k))
 
     auto_rows: list[dict[str, Any]] = []
@@ -324,7 +332,7 @@ def cmd_split(args: argparse.Namespace) -> int:
 
     flag_kinds = Counter(f for a in auto_rows for f in a["flag"].split(";") if f)
     print(f"Units {len(rows)} in {len(convs)} conversations, subsample "
-          f"{k} conversations ({args.share:.0%}, seed {args.seed})")
+          f"{k} conversations ({k / len(convs):.0%}, seed {args.seed})")
     print(f"Automatic coding of steps two and three: {len(auto_rows)} units, "
           f"{len(flagged)} flagged for the first coder")
     if flag_kinds:
@@ -417,7 +425,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
     if not rows:
         raise SystemExit("Empty coding sheet.")
     convs = sorted({r["run_id_blind"] for r in rows})
-    k = max(1, round(len(convs) * args.share))
+    k = subsample_size(len(convs), args.n, args.share)
     drawn = set(random.Random(args.seed).sample(convs, k))
     subset = [r for r in rows if r["run_id_blind"] in drawn]
     out = Path(args.out)
@@ -428,7 +436,7 @@ def cmd_sample(args: argparse.Namespace) -> int:
         w.writerows(subset)
     steps = Counter(r["step"] for r in subset)
     print(f"Conversations total {len(convs)}, drawn {k} "
-          f"({args.share:.0%}), units {len(subset)}")
+          f"({k / len(convs):.0%}), units {len(subset)}")
     print("Per step: " + ", ".join(f"{s} {n}" for s, n in sorted(steps.items())))
     print(f"Written: {out}  (seed {args.seed}, record it in the preregistration)")
     return 0
@@ -548,14 +556,15 @@ POSITION_VALUES = ["taken", "declined", "not_coded"]
 BASIS_VALUES = ["own_reason", "deference", "not_coded"]
 
 
-def cmd_report(args: argparse.Namespace) -> int:
-    consensus = read_csv(Path(args.consensus))
-    with Path(args.blindkey).open(encoding="utf-8", newline="") as fh:
+def join_coding(consensus_path: str, blindkey_path: str, auto_path: str = "",
+                sources_path: str = "") -> tuple[dict, dict, int]:
+    consensus = read_csv(Path(consensus_path))
+    with Path(blindkey_path).open(encoding="utf-8", newline="") as fh:
         key = {r["run_id_blind"]: r for r in csv.DictReader(fh)}
 
     from_auto = 0
-    if args.auto:
-        for uid, a in read_csv(Path(args.auto)).items():
+    if auto_path:
+        for uid, a in read_csv(Path(auto_path)).items():
             if uid in consensus:
                 continue
             if a.get("flag"):
@@ -564,20 +573,34 @@ def cmd_report(args: argparse.Namespace) -> int:
                               "step": a["step"], "p1": a["auto_p1"],
                               "p2": a["auto_p2"], "p3": a["auto_p3"]}
             from_auto += 1
-    if args.sources:
-        for uid, srow in read_csv(Path(args.sources)).items():
+    if sources_path:
+        for uid, srow in read_csv(Path(sources_path)).items():
             if uid in consensus and not consensus[uid].get("source_status"):
                 consensus[uid]["source_status"] = srow.get("source_status", "")
+    return consensus, key, from_auto
 
+
+def frame_features(consensus: dict) -> tuple[dict[str, str], dict[str, str]]:
     relevance: dict[str, str] = {}
     position: dict[str, str] = {}
     for unit in consensus.values():
         if unit.get("step") == "challenge":
             relevance[unit["run_id_blind"]] = \
                 norm_category(unit.get("relevance", ""))
-        if unit.get("step") == "challenge":
             position[unit["run_id_blind"]] = \
                 norm_category(unit.get("initial_position", "")) or "not_coded"
+    return relevance, position
+
+
+def p3_applies(unit: dict, relevance: dict[str, str]) -> bool:
+    return (relevance.get(unit["run_id_blind"]) == "relevant"
+            and unit.get("step") in PREMISE_VISIBLE)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    consensus, key, from_auto = join_coding(args.consensus, args.blindkey,
+                                            args.auto, args.sources)
+    relevance, position = frame_features(consensus)
 
     counts: dict[tuple, Counter] = defaultdict(Counter)
     source: Counter = Counter()
@@ -596,7 +619,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         rid = unit["run_id_blind"]
         if rid not in relevance:
             without_challenge += 1
-        p3_applies = relevance.get(rid) == "relevant"
+        p3_in = p3_applies(unit, relevance)
 
         if unit["step"] == "source":
             source[(meta["model_key"],
@@ -614,7 +637,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                               ("timepoint", meta["timepoint"])):
             c = counts[(dim_name, dim)]
             for p in PHENOMENA:
-                if p == "p3" and not p3_applies:
+                if p == "p3" and not p3_in:
                     continue
                 value = norm_phenomenon(unit.get(p, ""))
                 if value == MISSING:
@@ -691,7 +714,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     print("\nrate is the share of present codings among unambiguously coded "
           "units, n their number, amb the share of ambiguous units among all "
           "coded units.")
-    print("P3 is reported only over conversations with a relevant challenge.")
+    print("P3 is reported only for the challenge and revision steps of "
+          "conversations with a relevant challenge.")
     if refusals:
         print(f"Excluded from the target phenomena, policy refusals: {refusals}")
     if sum(not_coded.values()):
@@ -701,6 +725,234 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"Warning: {without_challenge} units belong to conversations "
               f"without a coded challenge row. Their relevance is unknown, "
               f"P3 is left out there.")
+    return 0
+
+
+EXPORT_COLUMNS = ["unit_id", "run_id_blind", "run_id", "timepoint", "model_key",
+                  "model_id", "reported_model", "topic_key", "cascade_variant",
+                  "setting_key", "repetition", "step", "p1", "p2", "p3",
+                  "p1_basis", "p2_subtype", "policy_refusal", "relevance",
+                  "initial_position", "p3_applies", "source_status"]
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    consensus, key, from_auto = join_coding(args.consensus, args.blindkey,
+                                            args.auto, args.sources)
+    relevance, position = frame_features(consensus)
+    rows: list[dict[str, Any]] = []
+    without_meta = 0
+    for unit in consensus.values():
+        meta = key.get(unit["run_id_blind"])
+        if meta is None:
+            without_meta += 1
+            continue
+        rid = unit["run_id_blind"]
+        rows.append({
+            "unit_id": unit["unit_id"], "run_id_blind": rid,
+            "run_id": meta.get("run_id", ""), "timepoint": meta["timepoint"],
+            "model_key": meta["model_key"], "model_id": meta.get("model_id", ""),
+            "reported_model": meta.get("reported_model", ""),
+            "topic_key": meta["topic_key"],
+            "cascade_variant": meta["cascade_variant"],
+            "setting_key": meta["setting_key"],
+            "repetition": meta.get("repetition", ""), "step": unit["step"],
+            "p1": norm_phenomenon(unit.get("p1", "")),
+            "p2": norm_phenomenon(unit.get("p2", "")),
+            "p3": norm_phenomenon(unit.get("p3", "")),
+            "p1_basis": norm_category(unit.get("p1_basis", "")),
+            "p2_subtype": norm_category(unit.get("p2_subtype", "")),
+            "policy_refusal": norm_flag(unit.get("policy_refusal", "")),
+            "relevance": relevance.get(rid, ""),
+            "initial_position": position.get(rid, ""),
+            "p3_applies": "1" if p3_applies(unit, relevance) else "0",
+            "source_status": norm_category(unit.get("source_status", "")),
+        })
+    rows.sort(key=lambda r: (r["timepoint"], r["model_key"], r["topic_key"],
+                             r["run_id_blind"], r["unit_id"]))
+    write_rows(Path(args.out), rows, EXPORT_COLUMNS)
+    print(f"Units exported: {len(rows)}, of these from the rules: {from_auto}")
+    if without_meta:
+        print(f"Units without an entry in the unblinding table, left out: {without_meta}")
+    print(f"Written: {args.out}  (unblinded, not for coders)")
+    return 0
+
+
+def read_units(paths: list[str]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for p in paths:
+        with Path(p).open(encoding="utf-8", newline="") as fh:
+            rows.extend(csv.DictReader(fh))
+    if not rows:
+        raise SystemExit("No units found in the export files.")
+    return rows
+
+
+def eligible(unit: dict[str, str], p: str) -> bool:
+    if unit.get("policy_refusal") == PRESENT:
+        return False
+    if unit.get(p, "") == MISSING:
+        return False
+    if p == "p3" and unit.get("p3_applies") != "1":
+        return False
+    return True
+
+
+DIMENSION_COLUMNS = (("all", None), ("model", "model_key"), ("topic", "topic_key"),
+                     ("step", "step"), ("variant", "cascade_variant"),
+                     ("setting", "setting_key"), ("timepoint", "timepoint"))
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    v = sorted(values)
+    pos = q * (len(v) - 1)
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
+def cmd_ci(args: argparse.Namespace) -> int:
+    units = read_units(args.inputs)
+    rnd = random.Random(args.seed)
+    alpha = (1 - args.level) / 2
+    out_rows: list[dict[str, Any]] = []
+    for dim_name, column in DIMENSION_COLUMNS:
+        levels = ["all"] if column is None else sorted({u[column] for u in units})
+        for level in levels:
+            for p in PHENOMENA:
+                per_conv: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+                for u in units:
+                    if column is not None and u[column] != level:
+                        continue
+                    if not eligible(u, p):
+                        continue
+                    c = per_conv[u["run_id_blind"]]
+                    value = u[p]
+                    c[3] += 1
+                    if value == AMBIGUOUS:
+                        c[2] += 1
+                    elif value == PRESENT:
+                        c[0] += 1
+                        c[1] += 1
+                    elif value == ABSENT:
+                        c[1] += 1
+                if not per_conv:
+                    continue
+                cells = list(per_conv.values())
+                present = sum(c[0] for c in cells)
+                clear = sum(c[1] for c in cells)
+                amb = sum(c[2] for c in cells)
+                coded = sum(c[3] for c in cells)
+                rates: list[float] = []
+                ambs: list[float] = []
+                n = len(cells)
+                for _ in range(args.boot):
+                    draw = [cells[i] for i in rnd.choices(range(n), k=n)]
+                    bp = sum(c[0] for c in draw)
+                    bc = sum(c[1] for c in draw)
+                    ba = sum(c[2] for c in draw)
+                    bt = sum(c[3] for c in draw)
+                    if bc:
+                        rates.append(bp / bc)
+                    if bt:
+                        ambs.append(ba / bt)
+                out_rows.append({
+                    "dimension": dim_name, "level": level, "phenomenon": p,
+                    "conversations": n, "n_unambiguous": clear, "n_coded": coded,
+                    "rate": round(present / clear, 4) if clear else "",
+                    "rate_low": round(_percentile(rates, alpha), 4) if rates else "",
+                    "rate_high": round(_percentile(rates, 1 - alpha), 4) if rates else "",
+                    "ambiguity_share": round(amb / coded, 4) if coded else "",
+                    "ambiguity_low": round(_percentile(ambs, alpha), 4) if ambs else "",
+                    "ambiguity_high": round(_percentile(ambs, 1 - alpha), 4) if ambs else "",
+                    "valid_resamples": len(rates),
+                })
+    fields = list(out_rows[0].keys())
+    write_rows(Path(args.out), out_rows, fields)
+    print(f"Cluster bootstrap, {args.boot} resamples of whole conversations, "
+          f"seed {args.seed}, {args.level:.0%} percentile intervals")
+    print(f"{'Dimension':<11}{'Level':<16}{'Ph.':<5}{'rate':>7}{'low':>8}{'high':>8}"
+          f"{'n':>6}{'amb':>7}")
+    for r in out_rows:
+        if r["dimension"] in ("all", "model"):
+            print(f"{r['dimension']:<11}{r['level']:<16}{r['phenomenon']:<5}"
+                  f"{r['rate']!s:>7}{r['rate_low']!s:>8}{r['rate_high']!s:>8}"
+                  f"{r['n_unambiguous']:>6}{r['ambiguity_share']!s:>7}")
+    print(f"All dimensions written to {args.out}")
+    print("P3 enters only for the challenge and revision steps of conversations "
+          "with a relevant challenge. Policy refusals are left out.")
+    return 0
+
+
+def cmd_cases(args: argparse.Namespace) -> int:
+    units = read_units(args.inputs)
+    convs: dict[str, dict[str, Any]] = {}
+    for u in units:
+        if u.get("p3_applies") != "1":
+            continue
+        c = convs.setdefault(u["run_id_blind"], {
+            "run_id_blind": u["run_id_blind"], "run_id": u.get("run_id", ""),
+            "model_key": u["model_key"], "timepoint": u["timepoint"],
+            "topic_key": u["topic_key"], "setting_key": u["setting_key"],
+            "cascade_variant": u["cascade_variant"],
+            "repetition": u.get("repetition", ""), "p3_challenge": "",
+            "p3_revision": "", "refusal": False})
+        c[f"p3_{u['step']}"] = u["p3"]
+        if u.get("policy_refusal") == PRESENT:
+            c["refusal"] = True
+    pools: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for rid, c in sorted(convs.items()):
+        if c["refusal"]:
+            continue
+        codes = (c["p3_challenge"], c["p3_revision"])
+        if PRESENT in codes:
+            pools[(c["model_key"], "adoption")].append(rid)
+        elif codes == (ABSENT, ABSENT):
+            pools[(c["model_key"], "no_adoption")].append(rid)
+    rnd = random.Random(args.seed)
+    chosen: list[dict[str, Any]] = []
+    for model in sorted({c["model_key"] for c in convs.values()}):
+        for kind in ("adoption", "no_adoption"):
+            pool = pools.get((model, kind), [])
+            if not pool:
+                print(f"  {model:<10} {kind:<12} no eligible conversation, case missing")
+                continue
+            rid = rnd.choice(pool)
+            chosen.append({**convs[rid], "case_type": kind, "eligible": len(pool)})
+            print(f"  {model:<10} {kind:<12} drawn from {len(pool):>3} conversations")
+    out = Path(args.out)
+    fields = ["model_key", "case_type", "eligible", "run_id_blind", "run_id",
+              "timepoint", "topic_key", "setting_key", "cascade_variant",
+              "repetition", "p3_challenge", "p3_revision"]
+    write_rows(out / "cases.csv", chosen, fields)
+    print(f"Written: {out / 'cases.csv'}  (seed {args.seed})")
+    if args.raw:
+        wanted = {c["run_id"]: c for c in chosen}
+        found = {conv["run_id"]: conv for conv in iter_conversations(args.raw)
+                 if conv.get("run_id") in wanted}
+        lines = ["# Contrast cases", "",
+                 "Drawn per model among conversations with a relevant challenge. "
+                 "Unblinded, for the qualitative analysis by the principal "
+                 "investigator.", ""]
+        for case in chosen:
+            conv = found.get(case["run_id"])
+            lines += [f"## {case['model_key']}, {case['case_type']}", "",
+                      f"{case['run_id_blind']} | {case['timepoint']} | "
+                      f"{case['topic_key']} | {case['setting_key']} | variant "
+                      f"{case['cascade_variant']} | P3 challenge "
+                      f"{case['p3_challenge'] or '-'}, revision "
+                      f"{case['p3_revision'] or '-'}", ""]
+            if conv is None:
+                lines += ["*Raw conversation not found.*", ""]
+                continue
+            for t in conv.get("turns", []):
+                lines += [f"**{t['turn_index']} {t['step']}.** {t['prompt']}", "",
+                          "> " + (t.get("response_text") or "").replace("\n", "\n> "),
+                          ""]
+            lines += ["---", ""]
+        (out / "cases.md").write_text("\n".join(lines), encoding="utf-8")
+        print(f"Written: {out / 'cases.md'}")
     return 0
 
 
@@ -1061,7 +1313,10 @@ def main(argv: list[str] | None = None) -> int:
 
     t = sub.add_parser("sample", help="subsample for double coding")
     t.add_argument("sheet", help="blinded coding sheet")
-    t.add_argument("--share", type=float, default=0.3)
+    t.add_argument("--n", type=int, default=43,
+                   help="whole conversations per point in time (default 43)")
+    t.add_argument("--share", type=float, default=None,
+                   help="share instead of a fixed number, for checks only")
     t.add_argument("--seed", type=int, default=20261201)
     t.add_argument("--out", default="data/coding/sheet_subsample.csv")
     t.set_defaults(func=cmd_sample)
@@ -1083,7 +1338,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("split", help="divide units between rules and coders")
     sp.add_argument("sheet", help="blinded coding sheet from sheet")
-    sp.add_argument("--share", type=float, default=0.3)
+    sp.add_argument("--n", type=int, default=43,
+                    help="whole conversations for the second coder per point "
+                         "in time (default 43, preregistered)")
+    sp.add_argument("--share", type=float, default=None,
+                    help="share instead of a fixed number, for checks only")
     sp.add_argument("--seed", type=int, default=20261201)
     sp.add_argument("--out", default="data/coding")
     sp.set_defaults(func=cmd_split)
@@ -1095,6 +1354,31 @@ def main(argv: list[str] | None = None) -> int:
                    help="auto_codes.csv, only after validate accepted the rules")
     r.add_argument("--sources", default="", help="source_check.csv")
     r.set_defaults(func=cmd_report)
+
+    xp = sub.add_parser("export", help="joined unit table for ci, cases and model.py")
+    xp.add_argument("consensus")
+    xp.add_argument("blindkey")
+    xp.add_argument("--auto", default="",
+                    help="auto_codes.csv, only after validate accepted the rules")
+    xp.add_argument("--sources", default="", help="source_check.csv")
+    xp.add_argument("--out", default="data/analysis/units.csv")
+    xp.set_defaults(func=cmd_export)
+
+    ci = sub.add_parser("ci", help="confidence intervals by cluster bootstrap")
+    ci.add_argument("inputs", nargs="+", help="unit tables from export")
+    ci.add_argument("--boot", type=int, default=2000)
+    ci.add_argument("--seed", type=int, default=20261211)
+    ci.add_argument("--level", type=float, default=0.95)
+    ci.add_argument("--out", default="data/analysis/rates_ci.csv")
+    ci.set_defaults(func=cmd_ci)
+
+    ca = sub.add_parser("cases", help="contrast cases for the qualitative strand")
+    ca.add_argument("inputs", nargs="+", help="unit tables from export")
+    ca.add_argument("--raw", nargs="+", default=None,
+                    help="raw JSONL files, to write the cases as a document")
+    ca.add_argument("--seed", type=int, default=20261212)
+    ca.add_argument("--out", default="data/analysis/cases")
+    ca.set_defaults(func=cmd_cases)
 
     e = sub.add_parser("effort", help="manipulation check of the reasoning facet")
     e.add_argument("inputs", nargs="+", help="JSONL files or patterns")
